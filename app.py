@@ -1,97 +1,23 @@
+from datetime import date
+
 import pandas as pd
 import streamlit as st
-from neo4j import GraphDatabase
+
+import neo4j_service as svc
 
 st.set_page_config(page_title="Sandal Recommendation", page_icon="🩴", layout="wide")
 
 
-# ---------- Neo4j connection ----------
-@st.cache_resource
-def get_driver():
-    driver = GraphDatabase.driver(
-        st.secrets["NEO4J_URI"],
-        auth=(st.secrets["NEO4J_USERNAME"], st.secrets["NEO4J_PASSWORD"]),
-    )
-    driver.verify_connectivity()
-    return driver
-
-
 @st.cache_data(ttl=300, show_spinner=False)
-def run_query(query: str, params: dict | None = None) -> pd.DataFrame:
-    result = get_driver().execute_query(
-        query,
-        params or {},
-        database_=st.secrets.get("NEO4J_DATABASE"),  # None = home database
-    )
-    return pd.DataFrame([r.data() for r in result.records])
+def load(fn_name: str, *args) -> pd.DataFrame:
+    return pd.DataFrame(getattr(svc, fn_name)(*args))
 
 
-# ---------- Queries ----------
-def get_users():
-    return run_query(
-        "MATCH (u:User) RETURN u.user_id AS user_id, u.name AS name ORDER BY user_id"
-    )
-
-
-def get_recommendations(user_id):
-    return run_query(
-        """
-        MATCH (me:User {user_id:$user_id})-[:FRIEND_OF]-(friend:User)
-              -[:WATCHED]->(sandal:Sandal)
-        WHERE NOT EXISTS { MATCH (me)-[:WATCHED]->(sandal) }
-        RETURN sandal.sandal_id AS sandal_id,
-               sandal.brand AS brand,
-               count(DISTINCT friend) AS friend_score,
-               collect(DISTINCT friend.name) AS friends
-        ORDER BY friend_score DESC, brand
-        """,
-        {"user_id": user_id},
-    )
-
-
-def get_watched(user_id):
-    return run_query(
-        """
-        MATCH (:User {user_id:$user_id})-[r:WATCHED]->(a:Sandal)
-        RETURN a.sandal_id AS sandal_id, a.brand AS brand,
-               toString(r.watch_date) AS watch_date
-        ORDER BY watch_date
-        """,
-        {"user_id": user_id},
-    )
-
-
-def get_friends(user_id):
-    return run_query(
-        """
-        MATCH (:User {user_id:$user_id})-[:FRIEND_OF]-(f:User)
-        OPTIONAL MATCH (f)-[:WATCHED]->(s:Sandal)
-        RETURN f.user_id AS friend_id, f.name AS friend,
-               s.brand AS sandal
-        ORDER BY friend, sandal
-        """,
-        {"user_id": user_id},
-    )
-
-
-def get_popularity():
-    return run_query(
-        """
-        MATCH (a:Sandal)
-        OPTIONAL MATCH (:User)-[w:WATCHED]->(a)
-        RETURN a.brand AS brand, count(w) AS watch_count
-        ORDER BY watch_count DESC, brand
-        """
-    )
-
-
-# ---------- Graph visualisation (Graphviz DOT) ----------
 def build_dot(me_name, watched, friends, recs):
     watched_set = set(watched["brand"]) if not watched.empty else set()
     rec_set = set(recs["brand"]) if not recs.empty else set()
     lines = [
-        "digraph G {",
-        "rankdir=LR; node [fontname=Helvetica];",
+        "digraph G {", "rankdir=LR; node [fontname=Helvetica];",
         f'"{me_name}" [shape=ellipse, style=filled, fillcolor="#FFD166"];',
     ]
     for b in watched_set:
@@ -111,57 +37,70 @@ def build_dot(me_name, watched, friends, recs):
     return "\n".join(lines)
 
 
-# ---------- UI ----------
 st.title("🩴 Sandal Recommendation System")
 st.caption("แนะนำรองเท้าแตะจากยี่ห้อที่เพื่อนเคยดู โดยใช้ Neo4j Graph Database")
 
 try:
-    users = get_users()
+    users = load("get_users")
 except Exception as e:
     st.error(f"เชื่อมต่อ Neo4j ไม่สำเร็จ: {e}")
     st.stop()
 
 if users.empty:
-    st.warning("ยังไม่มีข้อมูล User ในฐานข้อมูล กรุณารันสคริปต์โหลดข้อมูลใน Colab ก่อน")
+    st.warning("ยังไม่มีข้อมูลในฐานข้อมูล")
+    if st.button("โหลดข้อมูลตัวอย่าง"):
+        svc.seed_demo_data()
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
 
 with st.sidebar:
     st.header("เลือกผู้ใช้")
     options = dict(zip(users["user_id"], users["name"]))
-    user_id = st.selectbox(
-        "User", list(options), format_func=lambda uid: f"{options[uid]} ({uid})"
-    )
+    user_id = st.selectbox("User", list(options), format_func=lambda uid: f"{options[uid]} ({uid})")
     top_n = st.slider("จำนวนรายการแนะนำสูงสุด", 1, 10, 5)
+
+    with st.expander("➕ บันทึกการดูรองเท้าแตะ"):
+        sandals = load("get_sandals")
+        sid = st.selectbox(
+            "ยี่ห้อ", sandals["sandal_id"],
+            format_func=lambda x: sandals.set_index("sandal_id").loc[x, "brand"],
+        )
+        d = st.date_input("วันที่ดู", value=date.today())
+        if st.button("บันทึก"):
+            if svc.record_watch(user_id, sid, d.isoformat()):
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error("ไม่พบ User หรือ Sandal")
+
     if st.button("🔄 รีเฟรชข้อมูล"):
         st.cache_data.clear()
         st.rerun()
 
 me = options[user_id]
-recs = get_recommendations(user_id)
-watched = get_watched(user_id)
-friends = get_friends(user_id)
+recs = load("recommend_sandals", user_id, top_n)
+watched = load("get_watched", user_id)
+friends = load("get_friends", user_id)
 
 c1, c2, c3 = st.columns(3)
 c1.metric("เพื่อน", friends["friend_id"].nunique() if not friends.empty else 0)
 c2.metric("ยี่ห้อที่เคยดู", len(watched))
 c3.metric("รายการแนะนำ", len(recs))
 
-tab_rec, tab_hist, tab_graph, tab_pop = st.tabs(
-    ["🎯 แนะนำ", "👀 ประวัติการดู", "🕸️ กราฟ", "📊 ความนิยม"]
-)
+tab_rec, tab_hist, tab_graph, tab_pop = st.tabs(["🎯 แนะนำ", "👀 ประวัติการดู", "🕸️ กราฟ", "📊 ความนิยม"])
 
 with tab_rec:
     st.subheader(f"รองเท้าแตะที่แนะนำสำหรับ {me}")
     if recs.empty:
         st.info("ยังไม่มีรายการแนะนำ (เพื่อนยังไม่ได้ดูยี่ห้อที่ผู้ใช้ยังไม่เคยดู)")
     else:
-        top = recs.head(top_n)
-        for _, r in top.iterrows():
+        for _, r in recs.iterrows():
             with st.container(border=True):
                 a, b = st.columns([3, 1])
                 a.markdown(f"**{r['brand']}**  \nเพื่อนที่เคยดู: {', '.join(r['friends'])}")
                 b.metric("friend_score", int(r["friend_score"]))
-        st.bar_chart(top.set_index("brand")["friend_score"])
+        st.bar_chart(recs.set_index("brand")["friend_score"])
 
 with tab_hist:
     st.subheader(f"ประวัติการดูของ {me}")
@@ -174,12 +113,9 @@ with tab_graph:
     st.subheader(f"เครือข่ายของ {me}")
     st.caption("ส้ม = ผู้ใช้ | เทา = เพื่อน | ฟ้า = ที่ผู้ใช้เคยดู | เขียว = ที่ระบบแนะนำ")
     st.graphviz_chart(build_dot(me, watched, friends, recs), use_container_width=True)
-    if not friends.empty:
-        with st.expander("ดูตารางเพื่อนและรองเท้าที่เพื่อนดู"):
-            st.dataframe(friends, use_container_width=True, hide_index=True)
 
 with tab_pop:
     st.subheader("ยี่ห้อที่ถูกดูมากที่สุด")
-    pop = get_popularity()
+    pop = load("get_popularity")
     st.bar_chart(pop.set_index("brand")["watch_count"])
     st.dataframe(pop, use_container_width=True, hide_index=True)
